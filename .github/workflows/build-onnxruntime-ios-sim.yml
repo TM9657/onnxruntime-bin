@@ -1,0 +1,105 @@
+name: Build ONNX Runtime for iOS Simulator
+
+on:
+  workflow_dispatch:
+    inputs:
+      ort_tag:
+        description: 'ONNX Runtime tag or branch (e.g. v1.20.0)'
+        required: true
+        default: 'v1.20.0'
+      include_x86_64:
+        description: 'Also build x86_64 simulator slice'
+        required: false
+        default: 'true'
+
+jobs:
+  build-ios-simulator:
+    runs-on: macos-14
+    env:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+      APPLE_DEPLOY_TARGET: "13.0"
+      CONFIG: Release
+
+    steps:
+      - name: Checkout (this repo)
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          brew update
+          brew install cmake ninja || true
+          python3 -V
+          cmake --version
+
+      - name: Clone ONNX Runtime (${{ inputs.ort_tag }})
+        run: |
+          git clone --recursive https://github.com/microsoft/onnxruntime.git
+          cd onnxruntime
+          git fetch --tags
+          git checkout "${{ inputs.ort_tag }}"
+          git submodule update --init --recursive
+
+      - name: Build iOS simulator (arm64)
+        working-directory: onnxruntime
+        run: |
+          ./build.sh --config "${CONFIG}" --use_xcode \
+            --ios --apple_sysroot iphonesimulator --osx_arch arm64 \
+            --apple_deploy_target "${APPLE_DEPLOY_TARGET}" \
+            --skip_tests \
+            --cmake_extra_defines CMAKE_POLICY_VERSION_MINIMUM=3.5
+
+      - name: Build iOS simulator (x86_64)
+        if: inputs.include_x86_64 == 'true'
+        working-directory: onnxruntime
+        run: |
+          ./build.sh --config "${CONFIG}" --use_xcode \
+            --ios --apple_sysroot iphonesimulator --osx_arch x86_64 \
+            --apple_deploy_target "${APPLE_DEPLOY_TARGET}" \
+            --skip_tests \
+            --cmake_extra_defines CMAKE_POLICY_VERSION_MINIMUM=3.5
+
+      - name: Create XCFramework from built slices
+        working-directory: onnxruntime
+        run: |
+          python3 tools/ios/build_xcframework.py --build_dir build/iOS --config "${CONFIG}"
+          # Find output path without relying on 'fd'
+          echo "XCFRAMEWORK_OUT=$(find build -type d -name 'onnxruntime.xcframework' | head -n1)" >> "$GITHUB_ENV"
+
+      - name: Archive raw installed outputs (sim only)
+        working-directory: onnxruntime
+        run: |
+          set -euo pipefail
+          SIM_ARM64_PREFIX=$(find build/iOS -type d -path "*/Release/*iphonesimulator*arm64*/installed" | head -n1 || true)
+          SIM_X64_PREFIX=$(find build/iOS -type d -path "*/Release/*iphonesimulator*x86_64*/installed" | head -n1 || true)
+
+          echo "== Sim arm64 libs =="
+          [ -n "$SIM_ARM64_PREFIX" ] && find "$SIM_ARM64_PREFIX/lib" -maxdepth 1 -name '*.a' -print | sort || true
+          echo "== Sim x86_64 libs =="
+          [ -n "$SIM_X64_PREFIX" ] && find "$SIM_X64_PREFIX/lib" -maxdepth 1 -name '*.a' -print | sort || true
+
+          mkdir -p artifacts
+          [ -n "$SIM_ARM64_PREFIX" ] && tar -C "$(dirname "$SIM_ARM64_PREFIX")" -czf artifacts/installed-iphonesimulator-arm64-${{ inputs.ort_tag }}.tar.gz "$(basename "$SIM_ARM64_PREFIX")"
+          [ -n "$SIM_X64_PREFIX" ] && tar -C "$(dirname "$SIM_X64_PREFIX")" -czf artifacts/installed-iphonesimulator-x86_64-${{ inputs.ort_tag }}.tar.gz "$(basename "$SIM_X64_PREFIX")"
+
+      - name: Zip XCFramework
+        run: |
+          cd onnxruntime
+          zip -r ../onnxruntime-xcframework-iossim-${{ inputs.ort_tag }}.zip "$XCFRAMEWORK_OUT"
+
+      - name: Upload XCFramework
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-xcframework-iossim-${{ inputs.ort_tag }}
+          path: onnxruntime-xcframework-iossim-${{ inputs.ort_tag }}.zip
+          if-no-files-found: error
+          compression-level: 9
+
+      - name: Upload installed (headers+libs) archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-installed-iossim-${{ inputs.ort_tag }}
+          path: |
+            onnxruntime/artifacts/installed-iphonesimulator-arm64-${{ inputs.ort_tag }}.tar.gz
+            onnxruntime/artifacts/installed-iphonesimulator-x86_64-${{ inputs.ort_tag }}.tar.gz
+          if-no-files-found: warn
+          compression-level: 9
